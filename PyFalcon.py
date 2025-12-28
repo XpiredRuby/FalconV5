@@ -24,16 +24,15 @@ class FlightComputer:
         self.burn_triggered = False
 
     def decide_throttle(self, h, v, m, max_t, isp, g):
-        # 1. CALCULATE DYNAMIC A_MAX
-        # Acceleration right now
-        a_now = (max_t / m) - g
+        # 1. CALCULATE Acceleration max right now
+        a_now = (max_t / m) - g # which should be about 21.25617647 I think
         
-        # 2. PREDICT MASS LOSS (The "Aero" Lead's logic)
+        # 2. About How much mass is lost throughout
         m_dot_max = max_t / (g * isp)
         t_est = abs(v) / a_now
         m_final = m - (m_dot_max * t_est)
         
-        # 3. CALCULATE MASS-ADJUSTED H_BURN
+        # 3. Calculating the H burn throughout both masses (w/o fuel)
         a_final = (max_t / m_final) - g
         a_avg = (a_now + a_final) / 2
         h_required = (v**2) / (2 * a_avg)
@@ -137,4 +136,5 @@ def run_simulation():
 
 if __name__ == "__main__":
     run_simulation()
+
 
