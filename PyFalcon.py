@@ -18,7 +18,7 @@ class Rocket:
 
     def get_total_mass(self):
         return self.mass_dry + self.mass_fuel
-
+## PID EDIT ##
 class FlightComputer:
     def __init__(self):
         self.burn_triggered = False
@@ -137,3 +137,4 @@ def run_simulation():
 
 if __name__ == "__main__":
     run_simulation()
+
