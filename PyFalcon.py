@@ -3,14 +3,14 @@ import matplotlib.pyplot as plt
 
 class Rocket:
     def __init__(self):
-        # --- FALCON 9 FT DATA (From your source) ---
+        # --- FALCON 9 FT SPECS ---
         self.mass_dry = 22200.0      # kg (Inert mass)
-        self.mass_fuel = 5000.0      # kg (Landing reserve estimate)
-        self.height = 1500.0         # m (Starting altitude for landing burn)
+        self.mass_fuel = 5000.0      # kg (Landing reserve)
+        self.height = 1500.0         # m (Starting altitude)
         self.velocity = -120.0       # m/s (Starting downward velocity)
-        self.g0 = 9.81               # m/s^2 (Standard gravity)
-        self.isp = 282.0             # s (Sea-level Specific Impulse)
-        self.max_thrust = 845000.0   # N (Thrust of 1 Merlin 1D engine)
+        self.g0 = 9.81               # m/s^2 (Gravity)
+        self.isp = 282.0             # s (Sea-level Merlin 1D efficiency)
+        self.max_thrust = 845000.0   # N (Thrust of 1 Merlin 1D)
         
         # Hardware Constraints
         self.min_throttle = 0.55     # 55% Minimum throttle
@@ -20,87 +20,119 @@ class Rocket:
         return self.mass_dry + self.mass_fuel
 
 class FlightComputer:
-    def decide_throttle(self, height, velocity, mass):
-        """
-        COMPE TASK: This is where you write the controller.
-        Use a PID or a Suicide Burn (Hoverslam) algorithm.
-        """
-        # --- SIMPLE DUMMY LOGIC FOR TESTING ---
-        # (Replace this with PID logic later)
-        if height < 500 and velocity < -5:
-            return 0.8  # Fire at 80% thrust
-        return 0.0
+    def __init__(self):
+        self.burn_triggered = False
+
+    def decide_throttle(self, h, v, m, max_t, isp, g):
+        # 1. CALCULATE DYNAMIC A_MAX
+        # Acceleration right now
+        a_now = (max_t / m) - g
+        
+        # 2. PREDICT MASS LOSS (The "Aero" Lead's logic)
+        m_dot_max = max_t / (g * isp)
+        t_est = abs(v) / a_now
+        m_final = m - (m_dot_max * t_est)
+        
+        # 3. CALCULATE MASS-ADJUSTED H_BURN
+        a_final = (max_t / m_final) - g
+        a_avg = (a_now + a_final) / 2
+        h_required = (v**2) / (2 * a_avg)
+
+        # 4. TRIGGER LOGIC
+        # If we reach the required height, start the burn.
+        if h <= (h_required + 1.5): # 1.5m buffer for compute lag
+            self.burn_triggered = True
+
+        if not self.burn_triggered:
+            return 0.0
+
+        # 5. THROTTLE CONTROL (CompE Lead's logic)
+        # We aim for h_required to stay slightly above our current height
+        # This is a basic Proportional (P) controller
+        error = h_required - h
+        raw_output = 1.0 + (error * 0.1) # Try to stay at 100% unless we are too slow
+
+        # 6. APPLY HARDWARE CONSTRAINTS (The 55% Floor)
+        if raw_output < 0.55:
+            actual_throttle = 0.55
+        elif raw_output > 1.0:
+            actual_throttle = 1.0
+        else:
+            actual_throttle = raw_output
+            
+        # 7. AUTO-SHUTDOWN
+        # If velocity is near zero or positive, kill the engine to prevent flying back up
+        if v >= -0.1:
+            return 0.0
+            
+        return actual_throttle
 
 def run_simulation():
     rocket = Rocket()
     computer = FlightComputer()
     
-    dt = 0.01  # 100Hz simulation frequency
+    dt = 0.01 
     time = 0
-    history = {'time': [], 'height': [], 'velocity': [], 'thrust': [], 'mass': []}
+    history = {'time': [], 'height': [], 'velocity': [], 'throttle': [], 'mass': []}
 
-    print("--- F9 FT Landing Burn Started ---")
+    print("--- F9 FT Landing Burn Sequence Initialized ---")
     
     while rocket.height > 0:
-        # 1. READ SENSORS
+        # Get Sensor Data
         h, v, m = rocket.height, rocket.velocity, rocket.get_total_mass()
         
-        # 2. COMPUTE THROTTLE (The Brain)
-        raw_throttle = computer.decide_throttle(h, v, m)
+        # Computer decides throttle
+        throttle = computer.decide_throttle(h, v, m, rocket.max_thrust, rocket.isp, rocket.g0)
         
-        # 3. APPLY HARDWARE CONSTRAINTS (Merlin 1D limits)
-        if raw_throttle > 0:
-            # Clamp between 55% and 100%
-            actual_throttle = np.clip(raw_throttle, rocket.min_throttle, rocket.max_throttle)
-        else:
-            actual_throttle = 0.0
-            
-        # 4. PHYSICS ENGINE (Newton's 2nd Law)
-        thrust_force = actual_throttle * rocket.max_thrust
+        # PHYSICS ENGINE
+        # Calculate Thrust and Mass Flow
+        thrust_force = throttle * rocket.max_thrust
+        m_dot = thrust_force / (rocket.g0 * rocket.isp)
         
-        # Fuel consumption using Isp formula: m_dot = Thrust / (g0 * Isp)
-        fuel_burn_rate = thrust_force / (rocket.g0 * rocket.isp)
         if rocket.mass_fuel > 0:
-            rocket.mass_fuel -= fuel_burn_rate * dt
+            rocket.mass_fuel -= m_dot * dt
         else:
-            thrust_force = 0 # No fuel = no thrust
+            thrust_force = 0
             
-        # a = (T - mg) / m
-        net_force = thrust_force - (m * rocket.g0)
-        acceleration = net_force / m
+        # Newton's 2nd Law: a = (Thrust - Weight) / mass
+        acceleration = (thrust_force - (m * rocket.g0)) / m
         
-        # Update motion
+        # Euler Integration
         rocket.velocity += acceleration * dt
         rocket.height += rocket.velocity * dt
         time += dt
         
-        # Record data
+        # Save Data
         history['time'].append(time)
         history['height'].append(rocket.height)
         history['velocity'].append(rocket.velocity)
-        history['thrust'].append(actual_throttle)
+        history['throttle'].append(throttle)
         history['mass'].append(m)
 
-    # --- POST-FLIGHT ANALYSIS ---
-    impact_v = history['velocity'][-1]
-    print(f"Touchdown Time: {time:.2f}s")
-    print(f"Landing Velocity: {impact_v:.2f} m/s")
-    
-    if abs(impact_v) < 5.0:
-        print("RESULT: SUCCESSFUL LANDING! ")
-    else:
-        print("RESULT: Crashed -- Womp Womp")
+        # Emergency Stop if we start flying back up too much
+        if rocket.velocity > 5.0 and rocket.height > 10:
+            print("CRITICAL: Rocket is flying back into space! Adjust PID.")
+            break
 
-    # Plot results
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(8, 8))
-    ax1.plot(history['time'], history['height'], color='blue', label='Altitude')
-    ax1.set_ylabel("Height (m)")
+    # Results
+    impact_v = history['velocity'][-1]
+    print(f"Touchdown at {time:.2f}s | Impact Velocity: {impact_v:.2f} m/s")
+    
+    # VISUALIZATION
+    
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 8))
+    
+    ax1.plot(history['time'], history['height'], 'b', label="Altitude (m)")
+    ax1.axhline(0, color='black', linestyle='--')
+    ax1.set_title("Falcon 9 Landing Burn Profile")
     ax1.legend()
     
-    ax2.plot(history['time'], history['velocity'], color='red', label='Velocity')
-    ax2.plot(history['time'], [t * 10 for t in history['thrust']], '--', color='orange', label='Thrust (scaled)')
-    ax2.set_ylabel("Velocity (m/s) / Thrust")
+    ax2.plot(history['time'], history['velocity'], 'r', label="Velocity (m/s)")
+    ax2.plot(history['time'], [t * 10 for t in history['throttle']], 'g--', label="Throttle (10x)")
+    ax2.axhline(0, color='black', linestyle='--')
     ax2.legend()
+    
+    plt.tight_layout()
     plt.show()
 
 if __name__ == "__main__":
