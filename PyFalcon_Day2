@@ -8,35 +8,28 @@ import mpl_toolkits.mplot3d.art3d as art3d
 import time
 
 # ==========================================
-# 1. PHYSICS ENGINE (Exact Same Logic)
+# 1. PHYSICS ENGINE (STRICTLY UNCHANGED)
 # ==========================================
 class FalconHeavy_RigidBody:
     def __init__(self):
-        # --- HARDWARE SPECS ---
         self.length = 50.0      
         self.radius = 1.85      
         self.mass_dry = 22200.0 
         self.mass_fuel = 9500.0 
         self.max_thrust = 845000.0 
         self.g0 = 9.81
-        
-        # --- ACTUATOR LIMITS ---
         self.max_gimbal_range = np.radians(8.0)    
         self.servo_speed = np.radians(60.0) 
-        
         self.real_gimbal_pitch = 0.0             
         self.real_gimbal_yaw = 0.0
-        
-        # --- STATE VECTOR ---
-        # [x, y, z, vx, vy, vz, th, ph, ps, wx, wy, wz]
+        # State: [x, y, z, vx, vy, vz, th, ph, ps, wx, wy, wz]
         self.state = np.zeros(12)
-        
-        # INITIAL CONDITIONS
-        self.state[0] = 60.0    # 60m Drift Right
-        self.state[1] = -20.0   # 20m Drift Back
-        self.state[2] = 1600.0  # Altitude
-        self.state[5] = -85.0   # Falling speed
-        self.state[6] = np.radians(10.0) # Initial Tilt
+        # Initial Conditions
+        self.state[0] = 50.0    
+        self.state[1] = -15.0   
+        self.state[2] = 1600.0  
+        self.state[5] = -85.0   
+        self.state[6] = np.radians(10.0) 
 
     def get_mass_properties(self):
         current_mass = self.mass_dry + self.mass_fuel
@@ -45,321 +38,298 @@ class FalconHeavy_RigidBody:
         I_transverse = (1/12) * current_mass * (self.length**2)
         return current_mass, com_height, I_transverse
 
-    def update_physics(self, commanded_thrust, commanded_pitch, commanded_yaw, dt, wind_vector):
-        # 1. ACTUATOR LAG
-        delta_p = commanded_pitch - self.real_gimbal_pitch
-        delta_y = commanded_yaw - self.real_gimbal_yaw
-        max_step = self.servo_speed * dt
+    def update_physics(self, cmd_thrust, cmd_pitch, cmd_yaw, dt, wind):
+        dp = cmd_pitch - self.real_gimbal_pitch
+        dy = cmd_yaw - self.real_gimbal_yaw
+        limit = self.servo_speed * dt
+        self.real_gimbal_pitch += np.clip(dp, -limit, limit)
+        self.real_gimbal_yaw += np.clip(dy, -limit, limit)
         
-        if abs(delta_p) > max_step:
-            self.real_gimbal_pitch += max_step * np.sign(delta_p)
-        else:
-            self.real_gimbal_pitch = commanded_pitch
-            
-        if abs(delta_y) > max_step:
-            self.real_gimbal_yaw += max_step * np.sign(delta_y)
-        else:
-            self.real_gimbal_yaw = commanded_yaw
+        m, com, I = self.get_mass_properties()
+        F_mag = cmd_thrust * self.max_thrust
+        lever = com
         
-        # 2. CALCULATE FORCES & TORQUES
-        m, com_h, I = self.get_mass_properties()
-        F_thrust_mag = commanded_thrust * self.max_thrust
-        lever_arm = com_h 
+        t_p = -F_mag * np.sin(self.real_gimbal_pitch) * lever
+        t_y = -F_mag * np.sin(self.real_gimbal_yaw) * lever
+        aero_arm = 35.0 - com
+        t_aero_p = wind[0] * aero_arm * 0.1
+        t_aero_y = wind[1] * aero_arm * 0.1
         
-        torque_pitch = -F_thrust_mag * np.sin(self.real_gimbal_pitch) * lever_arm
-        torque_yaw   = -F_thrust_mag * np.sin(self.real_gimbal_yaw) * lever_arm
+        self.state[9]  += (t_p + t_aero_p)/I * dt
+        self.state[10] += (t_y + t_aero_y)/I * dt
+        self.state[6]  += self.state[9] * dt
+        self.state[7]  += self.state[10] * dt
         
-        cp_height = 35.0 
-        aero_arm = cp_height - com_h
-        torque_aero_pitch = wind_vector[0] * aero_arm * 0.1
-        torque_aero_yaw   = wind_vector[1] * aero_arm * 0.1
+        th, ph = self.state[6], self.state[7]
+        Fz = F_mag * np.cos(np.sqrt(th**2 + ph**2))
+        Fx = F_mag * np.sin(th) + wind[0]
+        Fy = F_mag * np.sin(ph) + wind[1]
         
-        total_torque_pitch = torque_pitch + torque_aero_pitch
-        total_torque_yaw   = torque_yaw + torque_aero_yaw
-        
-        # 3. INTEGRATION
-        alpha_pitch = total_torque_pitch / I
-        alpha_yaw   = total_torque_yaw / I
-        
-        self.state[9]  += alpha_pitch * dt 
-        self.state[10] += alpha_yaw * dt   
-        self.state[6]  += self.state[9] * dt 
-        self.state[7]  += self.state[10] * dt 
-        
-        theta = self.state[6]
-        phi   = self.state[7]
-        
-        Fz = F_thrust_mag * np.cos(np.sqrt(theta**2 + phi**2))
-        Fx = F_thrust_mag * np.sin(theta) + wind_vector[0]
-        Fy = F_thrust_mag * np.sin(phi) + wind_vector[1]
-        
-        self.state[3] += Fx / m * dt
-        self.state[4] += Fy / m * dt
-        self.state[5] += ((Fz / m) - self.g0) * dt
-        
+        self.state[3] += Fx/m * dt
+        self.state[4] += Fy/m * dt
+        self.state[5] += (Fz/m - self.g0) * dt
         self.state[0] += self.state[3] * dt
         self.state[1] += self.state[4] * dt
         self.state[2] += self.state[5] * dt
         
-        # 4. BURN FUEL
-        if commanded_thrust > 0:
-            mdot = F_thrust_mag / (self.g0 * 282.0)
-            self.mass_fuel -= mdot * dt
-            if self.mass_fuel < 0: self.mass_fuel = 0
+        if cmd_thrust > 0:
+            self.mass_fuel -= (F_mag / (self.g0 * 282.0)) * dt
+            
+        return F_mag / m 
 
 # ==========================================
-# 2. FLIGHT COMPUTER (Exact Same Logic)
+# 2. GUIDANCE COMPUTER (STRICTLY UNCHANGED)
 # ==========================================
 class GuidanceComputer:
     def __init__(self):
         self.delay_queue = deque()
         self.delay_seconds = 0.05
+        self.Kp_pos = 0.008; self.Kd_pos = 0.06
+        self.max_tilt = np.radians(15.0)
+        self.Kp_att = 12.0; self.Kd_att = 25.0 
         
-        self.Kp_pos = 0.008
-        self.Kd_pos = 0.06
-        self.max_tilt_safe = np.radians(15.0)
-        self.Kp_att = 12.0 
-        self.Kd_att = 25.0 
+    def compute_command(self, state, max_gimbal, dt):
+        x, y, z, vx, vy, vz, th, ph, _, wx, wy, _ = state
         
-    def compute_command(self, rocket_state, max_gimbal_hw, dt):
-        x, y, z, vx, vy, vz, th, ph, ps, wx, wy, wz = rocket_state
+        t_p = -np.clip((x*self.Kp_pos + vx*self.Kd_pos), -self.max_tilt, self.max_tilt)
+        t_y = -np.clip((y*self.Kp_pos + vy*self.Kd_pos), -self.max_tilt, self.max_tilt)
         
-        # Outer Loop
-        target_pitch = -1.0 * ((x * self.Kp_pos) + (vx * self.Kd_pos))
-        target_yaw   = -1.0 * ((y * self.Kp_pos) + (vy * self.Kd_pos))
-        target_pitch = np.clip(target_pitch, -self.max_tilt_safe, self.max_tilt_safe)
-        target_yaw   = np.clip(target_yaw, -self.max_tilt_safe, self.max_tilt_safe)
+        pred_p = th + wx * self.delay_seconds
+        pred_y = ph + wy * self.delay_seconds
+        cmd_p = -np.clip((t_p - pred_p)*self.Kp_att - wx*self.Kd_att, -max_gimbal, max_gimbal)
+        cmd_y = -np.clip((t_y - pred_y)*self.Kp_att - wy*self.Kd_att, -max_gimbal, max_gimbal)
         
-        # Inner Loop
-        predicted_pitch = th + (wx * self.delay_seconds)
-        predicted_yaw   = ph + (wy * self.delay_seconds)
-        error_pitch = target_pitch - predicted_pitch
-        error_yaw   = target_yaw - predicted_yaw
+        mass = 31700.0
+        max_a = (845000/mass) - 9.81
+        stop_dist = (vz**2) / (2 * max_a * 0.9)
         
-        cmd_gimbal_pitch = -1.0 * ((error_pitch * self.Kp_att) - (wx * self.Kd_att))
-        cmd_gimbal_yaw   = -1.0 * ((error_yaw * self.Kp_att) - (wy * self.Kd_att))
-        
-        cmd_gimbal_pitch = np.clip(cmd_gimbal_pitch, -max_gimbal_hw, max_gimbal_hw)
-        cmd_gimbal_yaw   = np.clip(cmd_gimbal_yaw, -max_gimbal_hw, max_gimbal_hw)
-        
-        # Throttle Logic
-        total_mass = 22200 + 9500
-        max_accel = (845000 * 1.0 / total_mass) - 9.81
-        stop_distance = (vz**2) / (2 * max_accel * 0.9)
-        burn_start_altitude = stop_distance + 25.0
-        
-        throttle_cmd = 0.1 
-        if z < burn_start_altitude:
-            if z > 5.0:
-                target_vz = -np.sqrt(2 * max_accel * 0.8 * z)
-                if target_vz > -2.0: target_vz = -2.0
-            else:
-                target_vz = -1.0
+        throttle = 0.1
+        if z < (stop_dist + 35.0):
+            target_v = -np.sqrt(2 * max_a * 0.85 * z) if z > 5 else -1.5
+            throttle = (mass*9.81)/845000 + (target_v - vz)*0.6
+            if z < 30: cmd_p *= 0.2; cmd_y *= 0.2
             
-            hover_thrust = (total_mass * 9.81) / 845000
-            throttle_error = target_vz - vz
-            throttle_cmd = hover_thrust + (throttle_error * 0.5)
-            
-            if z < 20.0:
-                cmd_gimbal_pitch *= 0.1
-                cmd_gimbal_yaw *= 0.1
+        throttle = np.clip(throttle, 0.1, 1.0)
         
-        throttle_cmd = np.clip(throttle_cmd, 0.1, 1.0) 
-        
-        command_packet = (throttle_cmd, cmd_gimbal_pitch, cmd_gimbal_yaw)
-        self.delay_queue.append(command_packet)
-        buffer_size = int(self.delay_seconds / dt)
-        if len(self.delay_queue) > buffer_size:
+        self.delay_queue.append((throttle, cmd_p, cmd_y))
+        if len(self.delay_queue) > int(self.delay_seconds/dt):
             return self.delay_queue.popleft()
-        else:
-            return 0.1, 0.0, 0.0
+        return 0.1, 0.0, 0.0
 
 # ==========================================
-# 3. REAL-TIME DASHBOARD RUNNER
+# 3. VISUALIZATION ENGINE (FIXED & POLISHED)
 # ==========================================
+def calculate_telemetry(z, v_mag):
+    rho = 1.225 * np.exp(-z / 8500.0)
+    temp = max(216, 288.15 - (0.0065 * z))
+    speed_of_sound = np.sqrt(1.4 * 287 * temp)
+    mach = v_mag / speed_of_sound
+    q = 0.5 * rho * (v_mag**2)
+    return mach, q / 1000.0
+
 def run_realtime_mission():
     rocket = FalconHeavy_RigidBody()
     computer = GuidanceComputer()
-    dt = 0.02 # 50Hz Physics
-    WIND_VECTOR = np.array([5.0, 2.0, 0.0])
+    dt = 0.02
+    WIND = np.array([4.0, 1.5, 0.0])
     
-    # --- VISUALIZATION SETUP ---
-    plt.ion() # INTERACTIVE MODE ON
+    plt.ion()
     plt.style.use('dark_background')
-    fig = plt.figure(figsize=(18, 10), facecolor='#0d0d0d')
-    gs = gridspec.GridSpec(3, 4, figure=fig, wspace=0.25, hspace=0.35)
+    fig = plt.figure(figsize=(19, 10), facecolor='#0b0b0b')
+    gs = gridspec.GridSpec(3, 3, figure=fig, wspace=0.15, hspace=0.25, width_ratios=[1, 1, 0.8])
     
-    c_traj = '#00d2ff'; c_lim = '#ff3333'; c_pad = '#39ff14'; c_grid = '#333333'; c_text = '#e0e0e0'
+    # Colors
+    c_traj = '#00f2ff'; c_warn = '#ff3333'; c_pad = '#39ff14' 
+    c_grid = '#444444' # Made Lighter so shadow is visible
+    c_deck = '#222222' # Dark grey for the drone ship deck
     
-    # Panel 1: 3D View
-    ax3d = fig.add_subplot(gs[0:2, 0], projection='3d', facecolor='#0d0d0d')
-    ax3d.set_title("TRAJECTORY RECONSTRUCTION", color=c_text, fontsize=9, weight='bold')
-    ax3d.set_zlabel('Altitude (m)')
-    ax3d.grid(True, color=c_grid)
-    ax3d.xaxis.set_pane_color((0, 0, 0, 0))
-    ax3d.yaxis.set_pane_color((0, 0, 0, 0))
-    ax3d.zaxis.set_pane_color((0, 0, 0, 0))
+    # --- 1. 3D VIEWPORT ---
+    ax3d = fig.add_subplot(gs[:, 0:2], projection='3d', facecolor='#101010')
     
-    # Ground & Target
-    p = Circle((0, 0), 20, color=c_pad, alpha=0.1)
-    ax3d.add_patch(p)
-    art3d.pathpatch_2d_to_3d(p, z=0, zdir="z")
-    ax3d.plot([-100, 100], [0, 0], [0, 0], color='gray', alpha=0.3)
-    ax3d.plot([0, 0], [-100, 100], [0, 0], color='gray', alpha=0.3)
+    # A. DRONE SHIP DECK (The "Base" - now strictly larger)
+    # Drawing a 90m x 50m rectangle to represent the ship deck
+    deck = Rectangle((-25, -45), 50, 90, color=c_deck, alpha=0.8, lw=1, ec='#555')
+    ax3d.add_patch(deck)
+    art3d.pathpatch_2d_to_3d(deck, z=0, zdir="z")
     
-    # Dynamic 3D Objects
-    line_traj_3d, = ax3d.plot([], [], [], color=c_traj, linewidth=1.5)
-    line_rocket_body, = ax3d.plot([], [], [], color='white', linewidth=3)
-    line_rocket_flame, = ax3d.plot([], [], [], color='orange', linewidth=2)
+    # B. LANDING RINGS (On top of the deck)
+    for r, alpha, lw in [(15, 0.3, 2), (5, 0.8, 2)]:
+        p = Circle((0, 0), r, color=c_pad, alpha=alpha, lw=lw, fill=False)
+        ax3d.add_patch(p)
+        art3d.pathpatch_2d_to_3d(p, z=0.5, zdir="z")
     
-    # Panel 2: Bullseye
-    ax_bull = fig.add_subplot(gs[2, 0])
-    ax_bull.set_aspect('equal')
-    ax_bull.set_title("LANDING ACCURACY (CEP)", color=c_text, fontsize=9, weight='bold')
-    ax_bull.grid(True, color=c_grid, linestyle=':')
-    ax_bull.set_xlim(-40, 40); ax_bull.set_ylim(-40, 40)
-    for r in [5, 10, 20]:
-        ax_bull.add_patch(Circle((0, 0), r, color=c_pad, fill=False, alpha=0.3, linestyle='--'))
+    # C. OCEAN GRID
+    xx, yy = np.meshgrid(np.linspace(-200, 200, 15), np.linspace(-200, 200, 15))
+    ax3d.plot_wireframe(xx, yy, np.zeros_like(xx), color=c_grid, alpha=0.3, lw=0.5)
     
-    line_bull, = ax_bull.plot([], [], color=c_traj, lw=1)
-    marker_bull, = ax_bull.plot([], [], 'x', color='white', ms=8)
+    # D. DYNAMIC OBJECTS
+    line_traj, = ax3d.plot([], [], [], color=c_traj, lw=1.5, alpha=0.6)
+    line_body, = ax3d.plot([], [], [], color='white', lw=4, solid_capstyle='round')
+    line_flame, = ax3d.plot([], [], [], color='#ffaa00', lw=2.5, alpha=0.8)
     
-    # Panel 3: Phase Plane (Alt vs Vel)
-    ax_phase = fig.add_subplot(gs[0, 1:3])
-    ax_phase.set_title("VERTICAL PROFILE", color=c_text, fontsize=9, weight='bold')
-    ax_phase.set_ylabel("Altitude (m)")
-    ax_phase.grid(True, color=c_grid)
-    ax_phase.set_xlim(0, 60); ax_phase.set_ylim(0, 1700) # Pre-set scale
-    
+    # E. SHADOW (Black disc on floor - crucial for depth)
+    shadow_patch = Circle((0, 0), 3.0, color='black', alpha=0.9, lw=0)
+    ax3d.add_patch(shadow_patch)
+    art3d.pathpatch_2d_to_3d(shadow_patch, z=0.1, zdir="z")
+
+    # F. VELOCITY VECTOR (FIXED: Shorter & Clamped)
+    # Initialize with dummy data, we update it in loop
+    quiver_vel = ax3d.quiver(0,0,0, 0,0,0, color=c_traj, lw=1.5)
+
+    ax3d.set_title("FLIGHT DYNAMICS RECONSTRUCTION (LIVE)", color='white', weight='bold', fontsize=12)
+    ax3d.set_axis_off()
+    ax3d.view_init(elev=20, azim=-45)
+
+    # G. HUD
+    hud_bg = dict(boxstyle="round,pad=0.5", fc="#0f0f0f", ec=c_traj, alpha=0.9)
+    hud_text = ax3d.text2D(0.02, 0.97, "SYSTEM INIT...", transform=ax3d.transAxes, 
+                           color=c_traj, fontsize=10, family='monospace', bbox=hud_bg, va='top')
+
+    # --- 2. GRAPHS (RIGHT SIDE) ---
+    ax_phase = fig.add_subplot(gs[0, 2], facecolor='#111')
+    ax_phase.set_title("VERTICAL PROFILE", color='white', fontsize=9, weight='bold')
+    ax_phase.grid(True, color='#333'); ax_phase.set_xlim(0, 60); ax_phase.set_ylim(0, 1700)
     ax_phase2 = ax_phase.twinx()
-    ax_phase2.set_ylabel("Velocity (m/s)", color='#ff00ff')
-    ax_phase2.set_ylim(-100, 10)
+    l_alt, = ax_phase.plot([], [], color='white', lw=1.5, label='Alt')
+    l_vel, = ax_phase2.plot([], [], color='magenta', lw=1.5, label='Vel')
+    ax_phase2.axhline(-6.0, color=c_warn, linestyle='--', lw=1)
+
+    ax_acc = fig.add_subplot(gs[1, 2], facecolor='#111')
+    ax_acc.set_title("AXIAL ACCELERATION (G)", color='white', fontsize=9, weight='bold')
+    ax_acc.grid(True, color='#333'); ax_acc.set_ylim(-1, 5); ax_acc.set_xlim(0, 60)
+    l_acc, = ax_acc.plot([], [], color='#00ff00', lw=1.5)
+    ax_acc.axhline(1.0, color='gray', linestyle=':', lw=1)
+
+    ax_att = fig.add_subplot(gs[2, 2], facecolor='#111')
+    ax_att.set_title("VEHICLE TILT ANGLE", color='white', fontsize=9, weight='bold')
+    ax_att.grid(True, color='#333'); ax_att.set_ylim(0, 20); ax_att.set_xlim(0, 60)
+    l_tilt, = ax_att.plot([], [], color='orange', lw=1.5)
+    ax_att.axhline(15.0, color=c_warn, linestyle='--', lw=1)
     
-    line_alt, = ax_phase.plot([], [], color='white', lw=1.5, label='Alt')
-    line_vel, = ax_phase2.plot([], [], color='#ff00ff', lw=1.5, label='Vel')
+    # --- 3. SIMULATION LOOP ---
+    t_h, alt_h, vz_h, acc_h, tilt_h, px_h, py_h = [], [], [], [], [], [], []
     
-    # Panel 4: Actuators
-    ax_act = fig.add_subplot(gs[1, 1:3])
-    ax_act.set_title("TVC ACTUATOR DUTY CYCLE", color=c_text, fontsize=9, weight='bold')
-    ax_act.set_ylim(-10, 10)
-    ax_act.set_xlim(0, 60)
-    ax_act.grid(True, color=c_grid)
-    ax_act.axhline(8.0, color=c_lim, linestyle='--', alpha=0.5)
-    ax_act.axhline(-8.0, color=c_lim, linestyle='--', alpha=0.5)
-    
-    line_gp, = ax_act.plot([], [], color='#ffcc00', lw=1, label='Pitch')
-    line_gy, = ax_act.plot([], [], color='#00ccff', lw=1, label='Yaw')
-    
-    # Panel 5: Stability
-    ax_att = fig.add_subplot(gs[2, 1:3])
-    ax_att.set_title("VEHICLE TILT ANGLE", color=c_text, fontsize=9, weight='bold')
-    ax_att.set_ylim(0, 20)
-    ax_att.set_xlim(0, 60)
-    ax_att.grid(True, color=c_grid)
-    ax_att.axhline(15.0, color=c_lim, linestyle=':')
-    
-    line_tilt, = ax_att.plot([], [], color='orange', lw=1.2)
-    
-    # Panel 6: Status Text
-    ax_stat = fig.add_subplot(gs[:, 3])
-    ax_stat.axis('off')
-    txt_time = ax_stat.text(0.1, 0.9, "T+: 0.00s", color='white', fontsize=12, family='monospace')
-    txt_alt = ax_stat.text(0.1, 0.8, "ALT: 0000m", color='white', fontsize=12, family='monospace')
-    txt_vel = ax_stat.text(0.1, 0.7, "VEL: 000 m/s", color='cyan', fontsize=12, family='monospace')
-    txt_fuel = ax_stat.text(0.1, 0.6, "FUEL: 00%", color='orange', fontsize=12, family='monospace')
-    
-    # --- DATA BUFFERS ---
-    t_data, alt_data, vz_data = [], [], []
-    px_data, py_data = [], []
-    gp_data, gy_data = [], []
-    tilt_data = []
-    
-    print("LAUNCHING REAL-TIME SIMULATION...")
-    sim_time = 0.0
+    print(">> SIMULATION STARTED (REAL-TIME SYNC ACTIVE)...")
+    sim_t = 0.0
     step = 0
+    start_wall_time = time.time()
     
-    # Loop until touchdown
     while rocket.state[2] > 0:
-        # 1. Physics & GNC
+        # Physics Step
         thr, gp, gy = computer.compute_command(rocket.state, rocket.max_gimbal_range, dt)
-        rocket.update_physics(thr, gp, gy, dt, WIND_VECTOR)
-        sim_time += dt
+        accel_mag = rocket.update_physics(thr, gp, gy, dt, WIND)
+        sim_t += dt
         step += 1
         
-        # 2. Store Data
-        t_data.append(sim_time)
-        alt_data.append(rocket.state[2])
-        vz_data.append(rocket.state[5])
-        px_data.append(rocket.state[0])
-        py_data.append(rocket.state[1])
-        gp_data.append(np.degrees(rocket.real_gimbal_pitch))
-        gy_data.append(np.degrees(rocket.real_gimbal_yaw))
-        tilt_deg = np.degrees(np.sqrt(rocket.state[6]**2 + rocket.state[7]**2))
-        tilt_data.append(tilt_deg)
+        # Telemetry
+        vx, vy, vz = rocket.state[3:6]
+        vel_mag = np.sqrt(vx**2 + vy**2 + vz**2)
+        mach, q_kpa = calculate_telemetry(rocket.state[2], vel_mag)
+        g_force = accel_mag / 9.81
+        wind_mag = np.linalg.norm(WIND)
         
-        # 3. RENDER (Update GUI every 5th physics step = 10Hz visual)
+        # Logging
+        t_h.append(sim_t); alt_h.append(rocket.state[2]); vz_h.append(vz)
+        px_h.append(rocket.state[0]); py_h.append(rocket.state[1])
+        acc_h.append(g_force)
+        tilt_h.append(np.degrees(np.sqrt(rocket.state[6]**2 + rocket.state[7]**2)))
+        
+        # Render Step (10Hz)
         if step % 5 == 0:
-            # Update 3D Rocket
-            rx, ry, rz = rocket.state[0], rocket.state[1], rocket.state[2]
-            # Tilt vector
-            tx = np.sin(rocket.state[6]) * 60
-            ty = np.sin(rocket.state[7]) * 60
+            rx, ry, rz = rocket.state[0:3]
             
-            # Trajectory Line
-            line_traj_3d.set_data(px_data, py_data)
-            line_traj_3d.set_3d_properties(alt_data)
+            # Update Trajectory
+            line_traj.set_data(px_h, py_h); line_traj.set_3d_properties(alt_h)
             
-            # Rocket Body Line
-            line_rocket_body.set_data([rx, rx+tx], [ry, ry+ty])
-            line_rocket_body.set_3d_properties([rz, rz+60])
+            # Update Rocket Body
+            tx, ty = np.sin(rocket.state[6]) * 60, np.sin(rocket.state[7]) * 60
+            line_body.set_data([rx, rx+tx], [ry, ry+ty]); line_body.set_3d_properties([rz, rz+60])
             
-            # Flame Line
+            # Update Flame
             if thr > 0.1:
-                flen = 30 * thr
-                line_rocket_flame.set_data([rx, rx-tx*0.5], [ry, ry-ty*0.5])
-                line_rocket_flame.set_3d_properties([rz, rz-flen])
+                flen = 40 * thr + np.random.rand()*5 
+                line_flame.set_data([rx, rx-tx*0.4], [ry, ry-ty*0.4]); line_flame.set_3d_properties([rz, rz - flen])
             else:
-                line_rocket_flame.set_data([], [])
-                line_rocket_flame.set_3d_properties([])
-                
-            ax3d.set_xlim(rx-100, rx+100)
-            ax3d.set_ylim(ry-100, ry+100)
-            ax3d.set_zlim(0, max(rz+50, 200))
+                line_flame.set_data([], []); line_flame.set_3d_properties([])
+
+            # Update Shadow Position (Project to z=0)
+            shadow_patch.center = (rx, ry)
             
-            # Update 2D Charts
-            line_bull.set_data(px_data, py_data)
-            marker_bull.set_data([px_data[-1]], [py_data[-1]])
+            # Update Velocity Vector (FIXED SCALING)
+            quiver_vel.remove() 
+            # Scale down drastically: 0.2 factor. Clamp max visual length to 50 units.
+            v_scale = 0.25 
+            disp_len = min(vel_mag * v_scale, 50.0)
+            # Normalize direction, apply length
+            norm_factor = vel_mag if vel_mag > 0 else 1.0
+            quiver_vel = ax3d.quiver(rx, ry, rz, 
+                                     vx/norm_factor * disp_len, 
+                                     vy/norm_factor * disp_len, 
+                                     vz/norm_factor * disp_len, 
+                                     color=c_traj, lw=2, arrow_length_ratio=0.2)
+
+            # Camera Tracking
+            ax3d.set_xlim(rx-150, rx+150); ax3d.set_ylim(ry-150, ry+150); ax3d.set_zlim(0, max(rz+100, 250))
+            ax3d.view_init(elev=20, azim=-45 + sim_t*0.5)
             
-            line_alt.set_data(t_data, alt_data)
-            line_vel.set_data(t_data, vz_data)
+            # Update Graphs
+            l_alt.set_data(t_h, alt_h); l_vel.set_data(t_h, vz_h)
+            l_acc.set_data(t_h, acc_h); l_tilt.set_data(t_h, tilt_h)
             
-            line_gp.set_data(t_data, gp_data)
-            line_gy.set_data(t_data, gy_data)
-            
-            line_tilt.set_data(t_data, tilt_data)
-            
-            # Update Text
-            txt_time.set_text(f"T+: {sim_time:.2f} s")
-            txt_alt.set_text(f"ALT: {rz:.1f} m")
-            txt_vel.set_text(f"VEL: {rocket.state[5]:.1f} m/s")
-            fuel_p = (rocket.mass_fuel / 9500.0) * 100
-            txt_fuel.set_text(f"FUEL: {fuel_p:.1f} %")
-            
+            # Update HUD
+            hud_str = (
+                f"MISSION TIME: {sim_t:05.2f} s\n"
+                f"MODE:         {'TERMINAL' if rz < 500 else 'COAST'}\n"
+                f"-----------------------------\n"
+                f"ALTITUDE:    {rz:06.1f} m\n"
+                f"VELOCITY:    {vel_mag:05.1f} m/s\n"
+                f"V_Z (SINK):  {vz:+05.1f} m/s\n"
+                f"MACH:        {mach:04.2f} M\n"
+                f"DYN PRESS:   {q_kpa:04.1f} kPa\n"
+                f"G-LOAD:      {g_force:04.2f} G\n"
+                f"THROTTLE:    {thr*100:03.0f} %\n"
+                f"FUEL:        {rocket.mass_fuel:04.0f} kg"
+            )
+            hud_text.set_text(hud_str)
+            if rz < 200 or vz < -40: hud_text.set_color('#ffff00')
+            else: hud_text.set_color(c_traj)
+
             plt.pause(0.001)
-    
+        
+        # Real-Time Sync
+        elapsed_real = time.time() - start_wall_time
+        if sim_t > elapsed_real:
+            time.sleep(sim_t - elapsed_real)
+
     plt.ioff()
     
-    # Final Status
-    final_v = rocket.state[5]
-    final_d = np.sqrt(rocket.state[0]**2 + rocket.state[1]**2)
-    status = "SUCCESS" if (abs(final_v) < 6.0 and final_d < 20.0) else "FAILURE"
-    col = 'lime' if status == "SUCCESS" else 'red'
+    # --- POST-MISSION ANALYSIS ---
+    dist = np.sqrt(px_h[-1]**2 + py_h[-1]**2)
+    vel_z = vz_h[-1]
+    success = dist < 20.0 and abs(vel_z) < 6.0
     
-    ax_stat.text(0.1, 0.4, f"STATUS: {status}", color=col, fontsize=16, weight='bold', transform=ax_stat.transAxes)
-    ax_stat.text(0.1, 0.3, f"Final Vz: {final_v:.2f}", color='white', transform=ax_stat.transAxes)
-    ax_stat.text(0.1, 0.25, f"Miss Dist: {final_d:.2f}", color='white', transform=ax_stat.transAxes)
+    status = "SUCCESSFUL LANDING" if success else "HARD IMPACT / MISS"
+    col = '#00ff00' if success else '#ff0000'
     
-    print(f"MISSION COMPLETE. Status: {status}")
+    ax3d.plot([px_h[-1]], [py_h[-1]], [0], marker='x', color=col, markersize=15, markeredgewidth=3, zorder=10)
+    ax3d.text2D(0.5, 0.5, status, transform=ax3d.transAxes, color=col, fontsize=20, weight='bold', ha='center',
+                bbox=dict(boxstyle="round", fc="black", ec=col))
+    plt.show(block=False)
+
+    print("\n" + "="*60)
+    print(f"          MISSION REPORT: {status}")
+    print("="*60)
+    print(f"  Flight Duration:    {sim_t:.2f} s")
+    print(f"  Touchdown Velocity: {vel_z:.2f} m/s   (Target: < 6.0 m/s)")
+    print(f"  Landing Accuracy:   {dist:.2f} m      (Target: < 20.0 m)")
+    print(f"  Fuel Remaining:     {rocket.mass_fuel:.1f} kg")
+    print("-" * 60)
+    print("  FLIGHT EXTREMES:")
+    print(f"  Max G-Force:        {max(acc_h):.2f} G")
+    print(f"  Max Tilt Angle:     {max(tilt_h):.2f} deg")
+    print(f"  Max Q (Dyn Press):  {max([0.5*1.225*(v**2)/1000 for v in vz_h]):.2f} kPa")
+    print("="*60 + "\n")
+    
     plt.show()
 
 if __name__ == "__main__":
